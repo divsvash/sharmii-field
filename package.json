@@ -1,0 +1,29 @@
+{
+  "name": "shramii-field",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "jest"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "expo": "^57.0.14",
+    "expo-crypto": "^57.0.1",
+    "expo-file-system": "^57.0.4",
+    "expo-sqlite": "^57.0.1",
+    "react": "^19.2.8",
+    "react-native": "^0.87.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.12",
+    "typescript": "^5.9.3"
+  }
+}
