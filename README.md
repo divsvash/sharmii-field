@@ -111,8 +111,18 @@ src/
   single `UPDATE ... WHERE status IN ('PENDING','FAILED_RETRYABLE')`; the
   database, not application code, performs the conditional transition.
   `changes === 1` means this call claimed it, `changes === 0` means someone
-  else already has. See "Known limitations" for the one related edge this
-  does not cover.
+  else already has.
+- **Recovery distinguishes "abandoned" from "still busy"** —
+  `recoverInFlightItems(staleAfterMs)` only reclaims an `IN_FLIGHT` row
+  once it has sat unclaimed-looking for at least `staleAfterMs`.
+  `SyncEngine.runOnce()` passes `DEFAULT_RECOVERY_STALE_AFTER_MS` (60s,
+  double `HttpSyncTransport`'s own default 30s request timeout) so a
+  second, overlapping `runOnce()` call cannot reclaim and re-dispatch an
+  item a still-live sibling call is genuinely working on. Cold-start
+  recovery (`openDatabase.ts`) still passes no threshold (recovers
+  unconditionally) — correct there because nothing else can hold a live
+  claim the instant a process starts. See "Known limitations" for what
+  this threshold does and doesn't guarantee.
 
 ## Testing
 
@@ -128,7 +138,11 @@ Two tiers:
   real HTTP server (`__tests__/helpers/MockApiServer.ts` — Node's built-in
   `http` module, no framework) reached over a real socket via `fetch`.
 
-As of this writing: **218 tests passing**, `tsc --noEmit` clean on both the
+As of this writing: **218 tests passing** as of the initial submission;
+additional tests were added for retry-limit enforcement and the
+recovery/concurrency fix described in "Known limitations" below, so the
+current count is higher — run `npm test` for the exact, current number
+rather than trusting this figure. `tsc --noEmit` clean on both the
 domain/data/test tsconfig and the separate app-shell tsconfig (see
 `tsconfig.app.json`).
 
@@ -187,19 +201,20 @@ Stated plainly, not minimized:
   separate from the main domain/test tsconfig so RN's type-resolution
   needs never affect the load-bearing verification path) and reviewed, but
   not executed. It has no automated tests.
-- **`recoverInFlightItems()` cannot distinguish a genuinely-dead process
-  from a concurrently-running live worker.** It unconditionally moves every
-  `IN_FLIGHT` row to `FAILED_RETRYABLE` whenever called (including at the
-  start of every `SyncEngine.runOnce()`). Proven directly in
-  `SyncEngine.fullstack.integration.test.ts`: if a second `SyncEngine`
-  instance calls `runOnce()` while a first worker is still legitimately
-  mid-dispatch on some item, the second worker's own recovery step will
-  reclaim and re-dispatch that item. The atomic `tryClaim` guarantee itself
-  is not violated (only one caller can hold `IN_FLIGHT` at a time) — but
-  recovery has no lease, heartbeat, or owner-identity concept, so it cannot
-  tell "abandoned" from "busy". Not addressed in this sprint; would need a
-  lease/expiry mechanism, deliberately out of scope per the "no scheduler
-  service" constraint.
+- **`recoverInFlightItems()`'s staleness threshold is a heuristic, not a
+  lease.** It correctly distinguishes "abandoned" from "claimed a moment
+  ago" using elapsed wall-clock time, but there is still no lease,
+  heartbeat, or owner-identity concept — a genuinely-hung request that
+  somehow outlives both `HttpSyncTransport`'s own 30s timeout and the 60s
+  recovery threshold (e.g. a transport bug that fails to honor its
+  `AbortController`) would eventually be reclaimed and re-dispatched by a
+  later call, same as before this fix. The threshold shrinks the race
+  window from "always" to "an unrealistic double-failure," it doesn't
+  eliminate the underlying assumption that a claim which outlives the
+  threshold is dead. A real lease/expiry/heartbeat mechanism would close
+  this fully; deliberately out of scope per the "no scheduler service"
+  constraint. Proven (both the fixed common case and the still-open
+  genuinely-stale case) in `SyncEngine.fullstack.integration.test.ts`.
 - **`OutboxRepository.listSyncable()` does not honor the retry-window
   gating (`nextAttemptAt`)** that `OutboxDispatchSelector` added in Phase
   1. `SyncEngine` never calls `listSyncable()` (it uses `listAll()` +
