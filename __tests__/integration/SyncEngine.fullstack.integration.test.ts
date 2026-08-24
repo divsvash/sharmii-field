@@ -7,8 +7,10 @@ import { HttpSyncTransport } from '../../src/data/api/HttpSyncTransport';
 import { dispatchOutboxItem } from '../../src/domain/sync/OutboxDispatcher';
 import { SyncEngine } from '../../src/domain/sync/SyncEngine';
 import { asIdempotencyKey, type NewOutboxItem } from '../../src/domain/sync/OutboxItem';
+import type { RetryPolicyConfig } from '../../src/domain/sync/RetryPolicy';
 import { createNodeSqliteTestDatabase } from '../helpers/NodeSqliteTestDatabase';
 import { MockApiServer } from '../helpers/MockApiServer';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 /**
  * The complete production path, proven end to end against real
@@ -165,7 +167,13 @@ describe('Full-stack SyncEngine integration (real SQLite + real HTTP)', () => {
     const outboxRepo = new SqliteOutboxRepository(db);
     const dispatchStore = new SqliteOutboxDispatchStore(db);
     const transport = new HttpSyncTransport({ baseUrl: server.baseUrl });
-    const engine = new SyncEngine(outboxRepo, dispatchStore, transport);
+    // recoveryStaleAfterMs: 0 — this test is a smoke test for the recovery
+    // mechanism itself (claim, die, come back, retry succeeds), not for
+    // the staleness threshold specifically (see the dedicated staleness
+    // tests above/below for that); tryClaim and runOnce() happen back to
+    // back here, which the real default (non-zero) threshold would
+    // correctly treat as "possibly still live" and refuse to touch.
+    const engine = new SyncEngine(outboxRepo, dispatchStore, transport, undefined, undefined, 0);
 
     await outboxRepo.insert(newOutboxItem({ id: 'A' }));
     // Simulate a prior process having claimed this item and then dying
@@ -220,16 +228,9 @@ describe('Full-stack SyncEngine integration (real SQLite + real HTTP)', () => {
   });
 
   it(
-    'Known limitation (documented, not silently accepted): SyncEngine.runOnce() recovers ' +
-      'abandoned IN_FLIGHT items unconditionally at the start of every run, with no way to ' +
-      "distinguish a genuinely-dead process's abandoned item from one a concurrently-running " +
-      'live worker still legitimately owns. A second engine instance calling runOnce() while ' +
-      "the first is still mid-dispatch will \"recover\" and re-dispatch that item itself. The " +
-      'atomic tryClaim guarantee (proven above) is not violated by this — the DB still allows ' +
-      'only one caller to hold IN_FLIGHT at a time — but recovery can hand a second worker a ' +
-      "fresh claim on an item the first worker hasn't actually abandoned. This is a real gap, " +
-      'not addressed in this sprint (see README "Known limitations"): recovery has no lease/' +
-      'heartbeat/owner-identity concept, so it cannot tell "dead" from "busy".',
+    'Fix proof: a genuinely-live in-flight claim is NOT reclaimed by a concurrently-running ' +
+      "engine's recovery step — worker B's recovery leaves worker A's fresh claim alone, so " +
+      'no duplicate HTTP request is made for the same item',
     async () => {
       const db = await freshDb();
       const outboxRepoA = new SqliteOutboxRepository(db);
@@ -241,21 +242,208 @@ describe('Full-stack SyncEngine integration (real SQLite + real HTTP)', () => {
       await outboxRepoA.insert(newOutboxItem({ id: 'A' }));
       server.setDefaultResponse(200);
 
-      await dispatchStoreA.tryClaim('A'); // worker A begins dispatch, holds the row
+      await dispatchStoreA.tryClaim('A'); // worker A begins dispatch, holds the row — updated_at is "now"
 
+      // Worker B's own runOnce() call, using the engine's default
+      // recovery staleness threshold (DEFAULT_RECOVERY_STALE_AFTER_MS).
+      // A's claim is only moments old, nowhere near stale.
       const engineB = new SyncEngine(outboxRepoB, dispatchStoreB, transportB);
       const summaryB = await engineB.runOnce();
 
-      // Demonstrates the limitation: worker B's own recovery step treated
-      // A's IN_FLIGHT status as abandoned, and worker B went ahead and
-      // dispatched (and, with the server returning 200, synced) it.
-      expect(summaryB.recovered).toBe(1);
-      expect(summaryB.attempted).toBe(1);
-      expect(summaryB.succeeded).toBe(1);
-      expect(server.requests).toHaveLength(1);
+      // The bug this used to demonstrate is fixed: worker B's recovery
+      // step correctly leaves A's fresh claim alone, so B has nothing
+      // eligible to select, makes no request, and never touches item A.
+      expect(summaryB.recovered).toBe(0);
+      expect(summaryB.attempted).toBe(0);
+      expect(summaryB.succeeded).toBe(0);
+      expect(server.requests).toHaveLength(0);
 
+      // Worker A still legitimately holds the claim, exactly as it left it.
+      const stateWhileALive = await outboxRepoA.getById('A');
+      expect(stateWhileALive?.status).toBe('IN_FLIGHT');
+
+      // Worker A finishing its own dispatch normally afterward is
+      // unaffected by B's run having happened.
+      await dispatchStoreA.markSynced('A');
       const finalState = await outboxRepoA.getById('A');
       expect(finalState?.status).toBe('SYNCED');
+    },
+  );
+
+  it(
+    'A genuinely-abandoned (stale) IN_FLIGHT item is still recovered and successfully ' +
+      're-dispatched by a later run — the staleness threshold does not break real crash recovery',
+    async () => {
+      const db = await freshDb();
+      const outboxRepo = new SqliteOutboxRepository(db);
+      const dispatchStore = new SqliteOutboxDispatchStore(db);
+      const transport = new HttpSyncTransport({ baseUrl: server.baseUrl });
+
+      await outboxRepo.insert(newOutboxItem({ id: 'A' }));
+      server.setDefaultResponse(200);
+
+      await dispatchStore.tryClaim('A'); // simulates a worker that then died mid-dispatch
+
+      // Directly backdate updated_at, simulating real elapsed time having
+      // passed since the (now-dead) process claimed this row — the same
+      // technique the atomicity/rollback tests use to reach into real
+      // SQLite state directly rather than waiting on the real clock.
+      const longAgo = new Date(Date.now() - 5 * 60_000).toISOString(); // 5 minutes ago
+      await db.runAsync(`UPDATE outbox_items SET updated_at = ? WHERE id = ?;`, [longAgo, 'A']);
+
+      const engine = new SyncEngine(outboxRepo, dispatchStore, transport); // default 60s threshold
+      const summary = await engine.runOnce();
+
+      expect(summary.recovered).toBe(1);
+      expect(summary.attempted).toBe(1);
+      expect(summary.succeeded).toBe(1);
+      expect(server.requests).toHaveLength(1);
+
+      const finalState = await outboxRepo.getById('A');
+      expect(finalState?.status).toBe('SYNCED');
+    },
+  );
+
+  it(
+    'Crash-recovery-to-dedup, end to end: claim -> send -> "die" before markSynced -> recover -> ' +
+      'retry -> exactly one real server-side application, when the server implements idempotency ' +
+      'dedup (MockApiServer.enableIdempotencyDedup)',
+    async () => {
+      const db = await freshDb();
+      const outboxRepo = new SqliteOutboxRepository(db);
+      const dispatchStore = new SqliteOutboxDispatchStore(db);
+      const transport = new HttpSyncTransport({ baseUrl: server.baseUrl });
+
+      server.enableIdempotencyDedup();
+      server.queueResponse(200);
+
+      await outboxRepo.insert(newOutboxItem({ id: 'A' }));
+
+      // "claim -> send": the real claim, then the real HTTP request —
+      // exactly what OutboxDispatcher would do — but calling
+      // transport.send() directly rather than going through
+      // dispatchOutboxItem()/markSynced(), to model the crash precisely:
+      // the server received and genuinely applied the mutation, but the
+      // process died before it could persist that outcome locally.
+      await dispatchStore.tryClaim('A');
+      const sendResult = await transport.send({
+        operation: 'PUNCH_IN',
+        entityId: 'entity-A',
+        idempotencyKey: asIdempotencyKey('idem-A'),
+        payload: { note: 'payload for A' },
+      });
+      expect(sendResult).toEqual({ outcome: 'success' }); // the server really did apply it
+      expect(server.appliedMutationCount).toBe(1);
+      // ...and then the process "dies" here: markSynced is never called.
+      // Item A is left IN_FLIGHT in the database, exactly as a real crash
+      // would leave it.
+
+      // Backdate updated_at so the recovery staleness threshold (see the
+      // recovery-vs-concurrency fix proof above) treats this as
+      // genuinely abandoned rather than "possibly still live."
+      const longAgo = new Date(Date.now() - 5 * 60_000).toISOString();
+      await db.runAsync(`UPDATE outbox_items SET updated_at = ? WHERE id = ?;`, [longAgo, 'A']);
+
+      // "recover -> retry": a fresh engine run, as if the app restarted.
+      // Queued in case dedup were somehow bypassed — if this response
+      // actually gets consumed, appliedMutationCount below would catch it.
+      server.queueResponse(200);
+      const engine = new SyncEngine(outboxRepo, dispatchStore, transport);
+      const summary = await engine.runOnce();
+
+      expect(summary.recovered).toBe(1);
+      expect(summary.succeeded).toBe(1); // the client correctly sees this as a successful sync...
+      expect(server.appliedMutationCount).toBe(1); // ...but the server never re-applied it a second time
+      expect(server.requests).toHaveLength(2);
+      expect(server.requests[1]?.deduped).toBe(true); // the retry was recognized and replayed, not re-run
+
+      const item = await outboxRepo.getById('A');
+      expect(item?.status).toBe('SYNCED');
+    },
+  );
+
+  it(
+    'Crash-recovery WITHOUT server-side dedup (today\'s honest baseline): the same claim -> send -> ' +
+      '"die" -> recover -> retry sequence applies the mutation a second time',
+    async () => {
+      const db = await freshDb();
+      const outboxRepo = new SqliteOutboxRepository(db);
+      const dispatchStore = new SqliteOutboxDispatchStore(db);
+      const transport = new HttpSyncTransport({ baseUrl: server.baseUrl });
+
+      // enableIdempotencyDedup() deliberately not called — this codebase
+      // has no real server, so this is the behavior it actually ships
+      // with today: nothing stops a duplicate application.
+      server.queueResponse(200);
+
+      await outboxRepo.insert(newOutboxItem({ id: 'A' }));
+
+      await dispatchStore.tryClaim('A');
+      await transport.send({
+        operation: 'PUNCH_IN',
+        entityId: 'entity-A',
+        idempotencyKey: asIdempotencyKey('idem-A'),
+        payload: { note: 'payload for A' },
+      });
+      expect(server.appliedMutationCount).toBe(1);
+
+      const longAgo = new Date(Date.now() - 5 * 60_000).toISOString();
+      await db.runAsync(`UPDATE outbox_items SET updated_at = ? WHERE id = ?;`, [longAgo, 'A']);
+
+      server.queueResponse(200);
+      const engine = new SyncEngine(outboxRepo, dispatchStore, transport);
+      const summary = await engine.runOnce();
+
+      expect(summary.succeeded).toBe(1);
+      expect(server.appliedMutationCount).toBe(2); // applied twice — exactly the gap the dedup test above closes
+    },
+  );
+
+  it(
+    'Retry limit: a persistently-failing item stops retrying and becomes FAILED_TERMINAL ' +
+      '(RETRY_LIMIT_EXCEEDED) after maxAttempts, against real SQLite and a real HTTP server, ' +
+      'and is never dispatched again',
+    async () => {
+      const db = await freshDb();
+      const outboxRepo = new SqliteOutboxRepository(db);
+      const dispatchStore = new SqliteOutboxDispatchStore(db);
+      const transport = new HttpSyncTransport({ baseUrl: server.baseUrl });
+      const smallLimitConfig: RetryPolicyConfig = { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 1000 };
+
+      // A controlled, monotonically-advancing clock (rather than the real
+      // wall clock) so each simulated "app restart" deterministically lands
+      // after the previous failure's nextAttemptAt, with no timing flakiness.
+      let currentTime = new Date('2026-08-22T09:00:00.000Z').getTime();
+      const advancingNow = () => {
+        currentTime += 5 * 60 * 1000; // 5 minutes per call — comfortably past any 1s backoff
+        return new Date(currentTime).toISOString();
+      };
+
+      const engine = new SyncEngine(outboxRepo, dispatchStore, transport, advancingNow, smallLimitConfig);
+
+      server.setDefaultResponse(503); // every request fails retryably, forever
+      await outboxRepo.insert(newOutboxItem({ id: 'A', createdAt: '2026-08-22T08:00:00.000Z' }));
+
+      // Each runOnce() call is one attempt, mirroring separate
+      // app-restarts/connectivity events over time.
+      await engine.runOnce();
+      await engine.runOnce();
+      const finalSummary = await engine.runOnce();
+
+      expect(server.requests).toHaveLength(3); // exactly maxAttempts real HTTP requests, not more
+      expect(finalSummary.retryLimitExceeded).toBe(1);
+
+      const item = await outboxRepo.getById('A');
+      expect(item?.status).toBe('FAILED_TERMINAL');
+      expect(item?.lastError?.kind).toBe('terminal');
+      expect(item?.lastError && 'reason' in item.lastError ? item.lastError.reason : null).toBe(
+        'RETRY_LIMIT_EXCEEDED',
+      );
+
+      // A further sync pass must not touch it again.
+      const afterExhaustion = await engine.runOnce();
+      expect(server.requests).toHaveLength(3);
+      expect(afterExhaustion.attempted).toBe(0);
     },
   );
 });
