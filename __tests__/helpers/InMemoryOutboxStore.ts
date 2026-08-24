@@ -24,12 +24,13 @@ export class InMemoryOutboxStore implements OutboxSnapshotSource, OutboxDispatch
     return this.items.get(id)?.status;
   }
 
-  async recoverInFlightItems(): Promise<number> {
+  async recoverInFlightItems(staleAfterMs = 0): Promise<number> {
     const now = new Date().toISOString();
+    const cutoff = new Date(Date.now() - staleAfterMs).toISOString();
     let recovered = 0;
 
     for (const [id, item] of this.items) {
-      if (item.status === 'IN_FLIGHT') {
+      if (item.status === 'IN_FLIGHT' && item.updatedAt <= cutoff) {
         this.items.set(id, {
           ...item,
           status: 'FAILED_RETRYABLE',
