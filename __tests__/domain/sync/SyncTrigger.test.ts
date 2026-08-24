@@ -12,6 +12,7 @@ function fakeSummary(overrides: Partial<SyncEngineRunSummary> = {}): SyncEngineR
     claimFailures: 0,
     blocked: 0,
     waitingForRetry: 0,
+    retryLimitExceeded: 0,
     ...overrides,
   };
 }
