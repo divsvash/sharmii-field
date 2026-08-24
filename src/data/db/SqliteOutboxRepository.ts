@@ -135,14 +135,10 @@ export class SqliteOutboxRepository implements OutboxRepository {
     );
   }
 
-  async recoverInFlightItems(): Promise<number> {
+  async recoverInFlightItems(staleAfterMs = 0): Promise<number> {
     const now = new Date().toISOString();
-    // attempts is deliberately NOT incremented here: we don't know whether
-    // a real network attempt occurred before the process died, so this
-    // isn't counted as a completed attempt — only as a status correction.
-    // next_attempt_at is cleared to NULL so the recovered item is
-    // immediately eligible rather than inheriting a stale future value
-    // from whatever failure preceded this IN_FLIGHT attempt.
+    const cutoff = new Date(Date.now() - staleAfterMs).toISOString();
+   
     const recoveryError: SyncError = {
       kind: 'retryable',
       reason: 'PROCESS_INTERRUPTED',
@@ -150,11 +146,17 @@ export class SqliteOutboxRepository implements OutboxRepository {
       occurredAt: now,
     };
 
+    // updated_at <= cutoff: with staleAfterMs = 0 (the default), cutoff
+    // equals "now", and every genuinely-persisted IN_FLIGHT row's
+    // updated_at was written strictly before this statement runs, so this
+    // still recovers unconditionally — the same behavior as before
+    // staleAfterMs existed. With a positive staleAfterMs, this excludes
+    // any row claimed more recently than the threshold.
     const result = await this.db.runAsync(
       `UPDATE outbox_items
        SET status = 'FAILED_RETRYABLE', last_error = ?, next_attempt_at = NULL, updated_at = ?
-       WHERE status = 'IN_FLIGHT';`,
-      [serializeSyncError(recoveryError), now],
+       WHERE status = 'IN_FLIGHT' AND updated_at <= ?;`,
+      [serializeSyncError(recoveryError), now, cutoff],
     );
 
     return result.changes;
