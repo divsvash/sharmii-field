@@ -1,3 +1,4 @@
+import { describe, expect, it } from 'vitest';
 import { runMigrations } from '../../../src/data/db/Migration';
 import { migrations } from '../../../src/data/db/migrations';
 import { SqliteOutboxRepository } from '../../../src/data/db/SqliteOutboxRepository';
@@ -180,6 +181,52 @@ function defineOutboxRepositoryContract(getRepo: () => OutboxRepository | Promis
     const item = await repo.getById('outbox-punch-in-1');
     expect(item?.status).toBe('PENDING');
   });
+
+  it(
+    'recoverInFlightItems(staleAfterMs) leaves an item alone if it was claimed more recently than ' +
+      'staleAfterMs ago — it might still be genuinely in progress',
+    async () => {
+      const repo = await getRepo();
+      await repo.insert(punchIn());
+      await repo.markInFlight('outbox-punch-in-1'); // claimed "now"
+
+      // A full minute is comfortably longer than the time this test itself
+      // takes to run, so this item is never actually stale relative to it.
+      const recoveredCount = await repo.recoverInFlightItems(60_000);
+      expect(recoveredCount).toBe(0);
+
+      const item = await repo.getById('outbox-punch-in-1');
+      expect(item?.status).toBe('IN_FLIGHT');
+    },
+  );
+
+  it(
+    'recoverInFlightItems() with no argument (the default) still recovers unconditionally, ' +
+      'regardless of how recently the item was claimed — this is the cold-start behavior',
+    async () => {
+      const repo = await getRepo();
+      await repo.insert(punchIn());
+      await repo.markInFlight('outbox-punch-in-1'); // claimed "now"
+
+      const recoveredCount = await repo.recoverInFlightItems(); // no staleAfterMs argument
+      expect(recoveredCount).toBe(1);
+
+      const item = await repo.getById('outbox-punch-in-1');
+      expect(item?.status).toBe('FAILED_RETRYABLE');
+    },
+  );
+
+  it(
+    'recoverInFlightItems(0) is equivalent to no argument: also recovers unconditionally',
+    async () => {
+      const repo = await getRepo();
+      await repo.insert(punchIn());
+      await repo.markInFlight('outbox-punch-in-1');
+
+      const recoveredCount = await repo.recoverInFlightItems(0);
+      expect(recoveredCount).toBe(1);
+    },
+  );
 
   it('getByEntityId finds the outbox item for a given local entity id', async () => {
     const repo = await getRepo();
