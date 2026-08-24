@@ -44,10 +44,17 @@ export interface ConnectivityListener {
  * calls could overlap. This function does not guard against that — doing
  * so would mean adding a queue/lock, which is exactly the kind of
  * scheduler-service complexity this sprint's constraints rule out. A
- * future slice can add that; for now, SyncEngine's own conditional claim
- * already ensures overlapping runs can't cause double-dispatch of the
- * same item (see the documented recovery-vs-concurrency limitation in
- * README "Known limitations" for the one related edge this doesn't cover).
+ * future slice can add that; for now, two overlapping calls are still
+ * safe against double-dispatching the *same* item: tryClaim's conditional
+ * UPDATE means only one caller can ever hold a given item's IN_FLIGHT
+ * claim, and recoverInFlightItems() only reclaims a claim once it's old
+ * enough that it can no longer plausibly belong to a still-live sibling
+ * call (see SyncEngine.DEFAULT_RECOVERY_STALE_AFTER_MS) — so a second,
+ * overlapping runOnce() call will not un-claim and re-dispatch an item the
+ * first call is still genuinely working on. What overlapping calls can
+ * still do, harmlessly, is duplicate *selection* work on items neither has
+ * claimed yet (both read the same PENDING item, one wins tryClaim, the
+ * other gets CLAIM_FAILED) — wasted CPU, not a duplicate HTTP request.
  */
 export function wireConnectivityToSyncTrigger(
   connectivity: ConnectivityListener,
