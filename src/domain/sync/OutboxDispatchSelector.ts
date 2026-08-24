@@ -1,5 +1,6 @@
 import type { OutboxItem, OutboxStatus } from './OutboxItem';
 import { isSyncable } from './OutboxItem';
+import { DEFAULT_RETRY_POLICY_CONFIG, shouldRetry, type RetryPolicyConfig } from './RetryPolicy';
 
 /**
  * Why an item is or isn't eligible for dispatch right now. This is a
@@ -24,11 +25,19 @@ import { isSyncable } from './OutboxItem';
  * RetryPolicy.nextDelayMs) hasn't elapsed yet. It is checked before
  * dependency status, since an item can't be dispatched early regardless
  * of what its dependency is doing.
+ *
+ * RETRY_LIMIT_EXCEEDED is checked before BLOCKED_ON_RETRY_WINDOW: an item
+ * that has exhausted RetryPolicy.shouldRetry's attempt budget must never
+ * become eligible again, regardless of what its nextAttemptAt says. This
+ * module still only classifies — it never writes FAILED_TERMINAL itself;
+ * see SyncEngine.finalizeExhaustedRetries for the write side.
  */
 export type OutboxEligibility =
   | { readonly kind: 'ELIGIBLE' }
   /** The item's own status isn't PENDING/FAILED_RETRYABLE (e.g. IN_FLIGHT, SYNCED, already FAILED_TERMINAL). */
   | { readonly kind: 'NOT_PENDING'; readonly status: OutboxStatus }
+  /** FAILED_RETRYABLE, but RetryPolicy.shouldRetry(item.attempts) says no attempts remain. Permanent — will not resolve on its own. */
+  | { readonly kind: 'RETRY_LIMIT_EXCEEDED'; readonly attempts: number }
   /** FAILED_RETRYABLE, but its nextAttemptAt is still in the future. */
   | { readonly kind: 'BLOCKED_ON_RETRY_WINDOW'; readonly nextAttemptAt: string }
   /** Waiting on a prerequisite that may still succeed (PENDING, IN_FLIGHT, or FAILED_RETRYABLE). */
@@ -41,16 +50,24 @@ export type OutboxEligibility =
 /**
  * Classifies a single item's dispatch eligibility against a snapshot of
  * outbox state, at a given moment in time. Pure: no I/O, no mutation, no
- * internal clock access (`now` is supplied by the caller) — the same
+ * internal clock access (`now` is supplied by the caller, and
+ * `retryPolicyConfig` defaults to the same DEFAULT_RETRY_POLICY_CONFIG
+ * OutboxDispatcher already uses for backoff, so the two stay consistent
+ * without every caller having to thread a config through) — the same
  * inputs always produce the same output.
  */
 export function classifyOutboxEligibility(
   item: OutboxItem,
   itemsById: ReadonlyMap<string, OutboxItem>,
   now: string,
+  retryPolicyConfig: RetryPolicyConfig = DEFAULT_RETRY_POLICY_CONFIG,
 ): OutboxEligibility {
   if (!isSyncable(item.status)) {
     return { kind: 'NOT_PENDING', status: item.status };
+  }
+
+  if (item.status === 'FAILED_RETRYABLE' && !shouldRetry(item.attempts, retryPolicyConfig)) {
+    return { kind: 'RETRY_LIMIT_EXCEEDED', attempts: item.attempts };
   }
 
   if (item.status === 'FAILED_RETRYABLE' && item.nextAttemptAt !== null && item.nextAttemptAt > now) {
@@ -85,12 +102,13 @@ export function classifyOutboxEligibility(
 export function evaluateOutboxEligibility(
   items: readonly OutboxItem[],
   now: string,
+  retryPolicyConfig: RetryPolicyConfig = DEFAULT_RETRY_POLICY_CONFIG,
 ): ReadonlyMap<string, OutboxEligibility> {
   const itemsById = new Map(items.map((item) => [item.id, item] as const));
   const result = new Map<string, OutboxEligibility>();
 
   for (const item of items) {
-    result.set(item.id, classifyOutboxEligibility(item, itemsById, now));
+    result.set(item.id, classifyOutboxEligibility(item, itemsById, now, retryPolicyConfig));
   }
 
   return result;
@@ -115,12 +133,19 @@ function compareForDispatchOrder(a: OutboxItem, b: OutboxItem): number {
  * `now`), in deterministic dispatch order. Operates entirely on the given
  * in-memory snapshot — no SQLite queries, no network, no timers. A caller
  * (SyncEngine) calls this with a snapshot it already loaded (e.g. via
- * OutboxRepository.listAll()) and dispatches in the returned order.
+ * OutboxRepository.listAll()) and dispatches in the returned order. An
+ * item classified RETRY_LIMIT_EXCEEDED is never ELIGIBLE, so it's
+ * excluded here the same way any other non-eligible kind is — this
+ * function still never writes anything.
  */
-export function selectEligibleOutboxItems(items: readonly OutboxItem[], now: string): readonly OutboxItem[] {
+export function selectEligibleOutboxItems(
+  items: readonly OutboxItem[],
+  now: string,
+  retryPolicyConfig: RetryPolicyConfig = DEFAULT_RETRY_POLICY_CONFIG,
+): readonly OutboxItem[] {
   const itemsById = new Map(items.map((item) => [item.id, item] as const));
 
   return items
-    .filter((item) => classifyOutboxEligibility(item, itemsById, now).kind === 'ELIGIBLE')
+    .filter((item) => classifyOutboxEligibility(item, itemsById, now, retryPolicyConfig).kind === 'ELIGIBLE')
     .sort(compareForDispatchOrder);
 }
