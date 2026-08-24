@@ -81,8 +81,9 @@ export class InMemoryOutboxRepository implements OutboxRepository {
     });
   }
 
-  async recoverInFlightItems(): Promise<number> {
+  async recoverInFlightItems(staleAfterMs = 0): Promise<number> {
     const now = new Date().toISOString();
+    const cutoff = new Date(Date.now() - staleAfterMs).toISOString();
     const recoveryError: SyncError = {
       kind: 'retryable',
       reason: 'PROCESS_INTERRUPTED',
@@ -92,7 +93,7 @@ export class InMemoryOutboxRepository implements OutboxRepository {
 
     let recovered = 0;
     for (const item of this.items.values()) {
-      if (item.status === 'IN_FLIGHT') {
+      if (item.status === 'IN_FLIGHT' && item.updatedAt <= cutoff) {
         this.items.set(item.id, {
           ...item,
           status: 'FAILED_RETRYABLE',
