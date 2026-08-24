@@ -30,6 +30,14 @@ export async function openDatabase(): Promise<SqlDatabase> {
   await runMigrations(db, migrations);
 
   const outboxRepo = new SqliteOutboxRepository(db);
+  // No staleAfterMs (i.e. 0): correct specifically because this runs once
+  // at process cold-start. Nothing else in this process could hold a live
+  // IN_FLIGHT claim the instant it starts, so every IN_FLIGHT row found
+  // here is, unambiguously, abandoned by whatever process held it before
+  // this one existed — unlike SyncEngine.runOnce(), which applies a
+  // staleness threshold because it may be called more than once, and by
+  // more than one overlapping caller, within a single already-running
+  // process's lifetime (see SyncEngine.DEFAULT_RECOVERY_STALE_AFTER_MS).
   const recoveredCount = await outboxRepo.recoverInFlightItems();
   if (recoveredCount > 0) {
     // eslint-disable-next-line no-console -- deliberate startup diagnostic, not a logging framework decision
