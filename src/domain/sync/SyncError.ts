@@ -23,6 +23,7 @@ export type TerminalReason =
   | 'BUSINESS_RULE_REJECTED' // request was well-formed but violates a server-side business rule
   | 'INVALID_IDEMPOTENCY_REQUEST' // server rejected the idempotency key/request shape itself
   | 'UNSUPPORTED_OPERATION' // client sent an operation the server no longer accepts
+  | 'RETRY_LIMIT_EXCEEDED' // RetryPolicy.shouldRetry(attempts) ran out before the item ever succeeded — not a server rejection, a local give-up
   | 'UNCLASSIFIED'; // failure signal didn't match any known category — treated as terminal out of caution, not as a silent default
 
 export interface RetryableSyncError {
