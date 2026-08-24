@@ -5,6 +5,8 @@ import {
   evaluateOutboxEligibility,
   selectEligibleOutboxItems,
 } from '../../../src/domain/sync/OutboxDispatchSelector';
+import type { RetryPolicyConfig } from '../../../src/domain/sync/RetryPolicy';
+import { describe, expect, it } from 'vitest';
 
 const NOW = '2026-08-21T12:00:00.000Z';
 
@@ -357,5 +359,66 @@ describe('selectEligibleOutboxItems / classifyOutboxEligibility — retry-window
     const b = makeItem({ id: 'B', dependsOnOutboxId: 'A', createdAt: '2026-08-21T09:01:00.000Z' });
 
     expect(selectEligibleOutboxItems([a, b], NOW)).toEqual([]);
+  });
+});
+
+describe('selectEligibleOutboxItems / classifyOutboxEligibility — retry-limit exhaustion', () => {
+  const smallLimitConfig: RetryPolicyConfig = { maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 30_000 };
+
+  it('excludes a FAILED_RETRYABLE item whose attempts have reached maxAttempts, even with no retry window blocking it', () => {
+    const item = makeItem({ id: 'X', status: 'FAILED_RETRYABLE', attempts: 3, nextAttemptAt: null });
+
+    expect(selectEligibleOutboxItems([item], NOW, smallLimitConfig)).toEqual([]);
+
+    const byId = new Map([['X', item]]);
+    expect(classifyOutboxEligibility(item, byId, NOW, smallLimitConfig)).toEqual({
+      kind: 'RETRY_LIMIT_EXCEEDED',
+      attempts: 3,
+    });
+  });
+
+  it('includes a FAILED_RETRYABLE item whose attempts are still under maxAttempts', () => {
+    const item = makeItem({ id: 'X', status: 'FAILED_RETRYABLE', attempts: 2, nextAttemptAt: null });
+
+    expect(selectEligibleOutboxItems([item], NOW, smallLimitConfig).map((i) => i.id)).toEqual(['X']);
+  });
+
+  it('classifies RETRY_LIMIT_EXCEEDED even when nextAttemptAt has already elapsed — exhaustion takes priority', () => {
+    const item = makeItem({
+      id: 'X',
+      status: 'FAILED_RETRYABLE',
+      attempts: 5,
+      nextAttemptAt: '2026-08-21T11:00:00.000Z', // before NOW — would otherwise be eligible
+    });
+
+    const byId = new Map([['X', item]]);
+    expect(classifyOutboxEligibility(item, byId, NOW, smallLimitConfig).kind).toBe('RETRY_LIMIT_EXCEEDED');
+  });
+
+  it('never exhausts a PENDING item (attempts is only meaningful once a failure has occurred)', () => {
+    const item = makeItem({ id: 'X', status: 'PENDING', attempts: 0 });
+
+    expect(selectEligibleOutboxItems([item], NOW, smallLimitConfig).map((i) => i.id)).toEqual(['X']);
+  });
+
+  it('blocks a dependent whose prerequisite has exhausted its retry limit, same as any other non-SYNCED prerequisite', () => {
+    const a = makeItem({
+      id: 'A',
+      status: 'FAILED_RETRYABLE',
+      attempts: 3,
+      nextAttemptAt: null,
+      createdAt: '2026-08-21T09:00:00.000Z',
+    });
+    const b = makeItem({ id: 'B', dependsOnOutboxId: 'A', createdAt: '2026-08-21T09:01:00.000Z' });
+
+    expect(selectEligibleOutboxItems([a, b], NOW, smallLimitConfig)).toEqual([]);
+  });
+
+  it('uses DEFAULT_RETRY_POLICY_CONFIG.maxAttempts (5) when no config is supplied', () => {
+    const stillEligible = makeItem({ id: 'X', status: 'FAILED_RETRYABLE', attempts: 4, nextAttemptAt: null });
+    const exhausted = makeItem({ id: 'Y', status: 'FAILED_RETRYABLE', attempts: 5, nextAttemptAt: null });
+
+    expect(selectEligibleOutboxItems([stillEligible], NOW).map((i) => i.id)).toEqual(['X']);
+    expect(selectEligibleOutboxItems([exhausted], NOW)).toEqual([]);
   });
 });
