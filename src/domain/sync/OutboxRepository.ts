@@ -29,13 +29,35 @@ export interface OutboxRepository {
     nextAttemptAt: string | null,
   ): Promise<void>;
   /**
-   * Process-death recovery: any item left IN_FLIGHT (the app died mid-sync,
-   * so whether the server received the request is unknown) is moved to
-   * FAILED_RETRYABLE. This is safe — not merely convenient — because every
-   * outbox item carries an idempotency key: retrying an uncertain request
-   * cannot double-apply it server-side. Must be called once at startup,
-   * before any new sync attempts begin. Returns the number of items
-   * recovered, for logging/telemetry.
+   * Process-death recovery: any item left IN_FLIGHT is a claim whose
+   * outcome is unknown — either the process that claimed it died mid-sync
+   * (server response unknown), or it's still being worked on right now by
+   * a live, concurrently-running caller. This method cannot see the
+   * difference directly; `staleAfterMs` is how the caller tells it apart:
+   *
+   *  - Omitted, or 0: recover every IN_FLIGHT item unconditionally,
+   *    regardless of how recently it was claimed. Correct ONLY at true
+   *    process cold-start (see openDatabase.ts) — nothing else could still
+   *    legitimately hold a live claim the instant this process starts, so
+   *    "IN_FLIGHT right now" can only mean "abandoned by a previous,
+   *    now-dead process."
+   *  - A positive value: only recover items whose most recent update is at
+   *    least that many milliseconds old. Intended for a caller that may
+   *    run repeatedly *within* one process's lifetime (SyncEngine.runOnce,
+   *    potentially triggered by more than one overlapping caller — a
+   *    connectivity listener firing twice, a manual "sync now" tap during
+   *    an existing run) — there, an IN_FLIGHT item younger than the
+   *    threshold might be a live, still-in-progress attempt by a sibling
+   *    call, and reclaiming it would let two callers dispatch the exact
+   *    same item concurrently. A stale-enough item is still recovered,
+   *    same as before.
+   *
+   * Idempotency keys make retrying an uncertain request safe even without
+   * this threshold — this isn't a correctness backstop against duplicate
+   * server-side mutations, it's what prevents an unnecessary *duplicate
+   * HTTP request* (and the resulting race between two callers writing the
+   * outcome) in the first place. Returns the number of items recovered,
+   * for logging/telemetry.
    */
-  recoverInFlightItems(): Promise<number>;
+  recoverInFlightItems(staleAfterMs?: number): Promise<number>;
 }
